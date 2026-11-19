@@ -809,6 +809,177 @@ def _load_packed_expert(scores, bias, offsets, experts, SCORING_FUNC: tl.constex
     return _pack_val_idx_fp32(ranked, offsets)
 
 
+@triton.jit
+def _load_packed_sigmoid_fp32(scores, bias, expert):
+    raw = tl.load(scores + expert).to(tl.float32)
+    unbiased = _legacy_sigmoid(raw, tl.float32)
+    selection = unbiased + tl.load(bias + expert).to(tl.float32)
+    selection = tl.where(selection == 0.0, 0.0, selection)
+    # Numeric max on the generic path ignores NaNs when finite scores exist.
+    return tl.where(selection == selection, _pack_val_idx_fp32(selection, expert), 0)
+
+
+@triton.jit
+def _grouped_topk_512_expert_16_kernel(
+    scores,
+    bias,
+    weights,
+    ids,
+    stride,
+    scale,
+    RENORMALIZE: tl.constexpr,
+    padding=None,
+    HAS_PADDING: tl.constexpr = False,
+):
+    row = tl.program_id(0)
+    if HAS_PADDING:
+        if tl.load(padding + row):
+            _write_padding(weights, ids, row, 16, 32)
+            return
+
+    # HY4 Flash: one warp owns 512 candidates, with 16 registers per lane.
+    # Sorting each lane once avoids reducing all 512 entries for every winner.
+    lane = tl.arange(0, 32)
+    row_scores = scores + row * stride
+    key0 = _load_packed_sigmoid_fp32(row_scores, bias, lane + 0)
+    key1 = _load_packed_sigmoid_fp32(row_scores, bias, lane + 32)
+    key2 = _load_packed_sigmoid_fp32(row_scores, bias, lane + 64)
+    key3 = _load_packed_sigmoid_fp32(row_scores, bias, lane + 96)
+    key4 = _load_packed_sigmoid_fp32(row_scores, bias, lane + 128)
+    key5 = _load_packed_sigmoid_fp32(row_scores, bias, lane + 160)
+    key6 = _load_packed_sigmoid_fp32(row_scores, bias, lane + 192)
+    key7 = _load_packed_sigmoid_fp32(row_scores, bias, lane + 224)
+    key8 = _load_packed_sigmoid_fp32(row_scores, bias, lane + 256)
+    key9 = _load_packed_sigmoid_fp32(row_scores, bias, lane + 288)
+    key10 = _load_packed_sigmoid_fp32(row_scores, bias, lane + 320)
+    key11 = _load_packed_sigmoid_fp32(row_scores, bias, lane + 352)
+    key12 = _load_packed_sigmoid_fp32(row_scores, bias, lane + 384)
+    key13 = _load_packed_sigmoid_fp32(row_scores, bias, lane + 416)
+    key14 = _load_packed_sigmoid_fp32(row_scores, bias, lane + 448)
+    key15 = _load_packed_sigmoid_fp32(row_scores, bias, lane + 480)
+    # Descending bitonic sort of the 16 lane-local candidates.
+    key0, key1 = tl.maximum(key0, key1), tl.minimum(key0, key1)
+    key2, key3 = tl.minimum(key2, key3), tl.maximum(key2, key3)
+    key4, key5 = tl.maximum(key4, key5), tl.minimum(key4, key5)
+    key6, key7 = tl.minimum(key6, key7), tl.maximum(key6, key7)
+    key8, key9 = tl.maximum(key8, key9), tl.minimum(key8, key9)
+    key10, key11 = tl.minimum(key10, key11), tl.maximum(key10, key11)
+    key12, key13 = tl.maximum(key12, key13), tl.minimum(key12, key13)
+    key14, key15 = tl.minimum(key14, key15), tl.maximum(key14, key15)
+    key0, key2 = tl.maximum(key0, key2), tl.minimum(key0, key2)
+    key1, key3 = tl.maximum(key1, key3), tl.minimum(key1, key3)
+    key4, key6 = tl.minimum(key4, key6), tl.maximum(key4, key6)
+    key5, key7 = tl.minimum(key5, key7), tl.maximum(key5, key7)
+    key8, key10 = tl.maximum(key8, key10), tl.minimum(key8, key10)
+    key9, key11 = tl.maximum(key9, key11), tl.minimum(key9, key11)
+    key12, key14 = tl.minimum(key12, key14), tl.maximum(key12, key14)
+    key13, key15 = tl.minimum(key13, key15), tl.maximum(key13, key15)
+    key0, key1 = tl.maximum(key0, key1), tl.minimum(key0, key1)
+    key2, key3 = tl.maximum(key2, key3), tl.minimum(key2, key3)
+    key4, key5 = tl.minimum(key4, key5), tl.maximum(key4, key5)
+    key6, key7 = tl.minimum(key6, key7), tl.maximum(key6, key7)
+    key8, key9 = tl.maximum(key8, key9), tl.minimum(key8, key9)
+    key10, key11 = tl.maximum(key10, key11), tl.minimum(key10, key11)
+    key12, key13 = tl.minimum(key12, key13), tl.maximum(key12, key13)
+    key14, key15 = tl.minimum(key14, key15), tl.maximum(key14, key15)
+    key0, key4 = tl.maximum(key0, key4), tl.minimum(key0, key4)
+    key1, key5 = tl.maximum(key1, key5), tl.minimum(key1, key5)
+    key2, key6 = tl.maximum(key2, key6), tl.minimum(key2, key6)
+    key3, key7 = tl.maximum(key3, key7), tl.minimum(key3, key7)
+    key8, key12 = tl.minimum(key8, key12), tl.maximum(key8, key12)
+    key9, key13 = tl.minimum(key9, key13), tl.maximum(key9, key13)
+    key10, key14 = tl.minimum(key10, key14), tl.maximum(key10, key14)
+    key11, key15 = tl.minimum(key11, key15), tl.maximum(key11, key15)
+    key0, key2 = tl.maximum(key0, key2), tl.minimum(key0, key2)
+    key1, key3 = tl.maximum(key1, key3), tl.minimum(key1, key3)
+    key4, key6 = tl.maximum(key4, key6), tl.minimum(key4, key6)
+    key5, key7 = tl.maximum(key5, key7), tl.minimum(key5, key7)
+    key8, key10 = tl.minimum(key8, key10), tl.maximum(key8, key10)
+    key9, key11 = tl.minimum(key9, key11), tl.maximum(key9, key11)
+    key12, key14 = tl.minimum(key12, key14), tl.maximum(key12, key14)
+    key13, key15 = tl.minimum(key13, key15), tl.maximum(key13, key15)
+    key0, key1 = tl.maximum(key0, key1), tl.minimum(key0, key1)
+    key2, key3 = tl.maximum(key2, key3), tl.minimum(key2, key3)
+    key4, key5 = tl.maximum(key4, key5), tl.minimum(key4, key5)
+    key6, key7 = tl.maximum(key6, key7), tl.minimum(key6, key7)
+    key8, key9 = tl.minimum(key8, key9), tl.maximum(key8, key9)
+    key10, key11 = tl.minimum(key10, key11), tl.maximum(key10, key11)
+    key12, key13 = tl.minimum(key12, key13), tl.maximum(key12, key13)
+    key14, key15 = tl.minimum(key14, key15), tl.maximum(key14, key15)
+    key0, key8 = tl.maximum(key0, key8), tl.minimum(key0, key8)
+    key1, key9 = tl.maximum(key1, key9), tl.minimum(key1, key9)
+    key2, key10 = tl.maximum(key2, key10), tl.minimum(key2, key10)
+    key3, key11 = tl.maximum(key3, key11), tl.minimum(key3, key11)
+    key4, key12 = tl.maximum(key4, key12), tl.minimum(key4, key12)
+    key5, key13 = tl.maximum(key5, key13), tl.minimum(key5, key13)
+    key6, key14 = tl.maximum(key6, key14), tl.minimum(key6, key14)
+    key7, key15 = tl.maximum(key7, key15), tl.minimum(key7, key15)
+    key0, key4 = tl.maximum(key0, key4), tl.minimum(key0, key4)
+    key1, key5 = tl.maximum(key1, key5), tl.minimum(key1, key5)
+    key2, key6 = tl.maximum(key2, key6), tl.minimum(key2, key6)
+    key3, key7 = tl.maximum(key3, key7), tl.minimum(key3, key7)
+    key8, key12 = tl.maximum(key8, key12), tl.minimum(key8, key12)
+    key9, key13 = tl.maximum(key9, key13), tl.minimum(key9, key13)
+    key10, key14 = tl.maximum(key10, key14), tl.minimum(key10, key14)
+    key11, key15 = tl.maximum(key11, key15), tl.minimum(key11, key15)
+    key0, key2 = tl.maximum(key0, key2), tl.minimum(key0, key2)
+    key1, key3 = tl.maximum(key1, key3), tl.minimum(key1, key3)
+    key4, key6 = tl.maximum(key4, key6), tl.minimum(key4, key6)
+    key5, key7 = tl.maximum(key5, key7), tl.minimum(key5, key7)
+    key8, key10 = tl.maximum(key8, key10), tl.minimum(key8, key10)
+    key9, key11 = tl.maximum(key9, key11), tl.minimum(key9, key11)
+    key12, key14 = tl.maximum(key12, key14), tl.minimum(key12, key14)
+    key13, key15 = tl.maximum(key13, key15), tl.minimum(key13, key15)
+    key0, key1 = tl.maximum(key0, key1), tl.minimum(key0, key1)
+    key2, key3 = tl.maximum(key2, key3), tl.minimum(key2, key3)
+    key4, key5 = tl.maximum(key4, key5), tl.minimum(key4, key5)
+    key6, key7 = tl.maximum(key6, key7), tl.minimum(key6, key7)
+    key8, key9 = tl.maximum(key8, key9), tl.minimum(key8, key9)
+    key10, key11 = tl.maximum(key10, key11), tl.minimum(key10, key11)
+    key12, key13 = tl.maximum(key12, key13), tl.minimum(key12, key13)
+    key14, key15 = tl.maximum(key14, key15), tl.minimum(key14, key15)
+
+    top_experts = tl.full((32,), 0, tl.uint32)
+    group_score = tl.full((), 0.0, tl.float32)
+    for k in tl.static_range(0, 16):
+        packed_max = _packed_max_uint32(key0, 0)
+        selected_value, selected = _unpack_val_idx_fp32(packed_max)
+        if k < 2:
+            group_score += selected_value
+        top_experts = tl.where(lane == k, selected, top_experts)
+        update = key0 == packed_max
+        key0 = tl.where(update, key1, key0)
+        key1 = tl.where(update, key2, key1)
+        key2 = tl.where(update, key3, key2)
+        key3 = tl.where(update, key4, key3)
+        key4 = tl.where(update, key5, key4)
+        key5 = tl.where(update, key6, key5)
+        key6 = tl.where(update, key7, key6)
+        key7 = tl.where(update, key8, key7)
+        key8 = tl.where(update, key9, key8)
+        key9 = tl.where(update, key10, key9)
+        key10 = tl.where(update, key11, key10)
+        key11 = tl.where(update, key12, key11)
+        key12 = tl.where(update, key13, key12)
+        key13 = tl.where(update, key14, key13)
+        key14 = tl.where(update, key15, key14)
+        key15 = tl.where(update, 0, key15)
+
+    # Reuse the two leading winners to preserve the generic invalid-group rule.
+    group_valid = (group_score > -float("inf")) & (group_score < float("inf"))
+    selected_scores = tl.load(row_scores + top_experts, lane < 16, 0.0)
+    selected_weights = _legacy_sigmoid(selected_scores.to(tl.float32), tl.float32)
+    selected_weights = tl.where(lane < 16, selected_weights, 0.0)
+    if RENORMALIZE:
+        scale = scale / (tl.sum(selected_weights, 0) + 1e-20)
+    tl.store(
+        weights + row * 16 + lane,
+        tl.where(group_valid, selected_weights * scale, 1.0 / 16),
+        lane < 16,
+    )
+    tl.store(ids + row * 16 + lane, tl.where(group_valid, top_experts, lane), lane < 16)
+
+
 # A single warp owns all candidates for one token. Keep the measured layout
 # fixed; multi-token CTA alternatives were slower on the target workloads.
 @triton.jit
@@ -1166,6 +1337,18 @@ def grouped_topk(
     is_single_group = (
         (n_group == 1) & (topk_group == 1) & (num_experts <= 256) & (topk <= 8)
     )
+    is_512_expert_top16 = (
+        (n_group == 1)
+        & (topk_group == 1)
+        & (num_experts == 512)
+        & (topk == 16)
+        & (scoring_func == 1)
+        & (scores.dtype == torch.float32)
+        & (bias.dtype == torch.float32)
+        & (bias.stride(0) == 1)
+        & (scores.stride(1) == 1)
+        & (runtime.device.vendor_name == "nvidia")
+    )
     # DeepSeek-v3.2
     is_multi_group = (
         (n_group > 1)
@@ -1176,7 +1359,10 @@ def grouped_topk(
         & (topk <= 8)
         & (topk_group <= 4)
     )
-    if has_padding and (num_tokens == 0 or (n_group == 1 and not is_single_group)):
+    if has_padding and (
+        num_tokens == 0
+        or (n_group == 1 and not is_single_group and not is_512_expert_top16)
+    ):
         shape = (num_tokens, topk)
         topk_values = torch.empty(shape, device=scores.device, dtype=torch.float32)
         topk_indices = torch.empty(shape, device=scores.device, dtype=torch.int32)
@@ -1201,6 +1387,29 @@ def grouped_topk(
                 BLOCK_TOPK=triton.next_power_of_2(max(2, topk)),
                 # Use the native JIT binder, not LibEntry's 3.7 cache-hit launcher.
                 num_warps=4,
+            )
+        return topk_values, topk_indices
+
+    if is_512_expert_top16:
+        topk_values = torch.empty(
+            (num_tokens, topk), device=scores.device, dtype=torch.float32
+        )
+        topk_indices = torch.empty(
+            (num_tokens, topk), device=scores.device, dtype=torch.int32
+        )
+        if num_tokens:
+            _grouped_topk_512_expert_16_kernel[(num_tokens,)](
+                scores,
+                bias,
+                topk_values,
+                topk_indices,
+                scores.stride(0),
+                routed_scaling_factor,
+                RENORMALIZE=renormalize,
+                padding=is_padding,
+                HAS_PADDING=has_padding,
+                num_warps=1,
+                num_stages=3,
             )
         return topk_values, topk_indices
 
